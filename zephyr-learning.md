@@ -591,32 +591,67 @@ Workqueues provide a mechanism for deferring work execution to a dedicated threa
   ```
 - ⚠️ **Important:** Timer handlers run in interrupt context—avoid blocking APIs there. Instead, trigger lightweight actions or hand work to a queue as shown above.
 
-## 7. Power Management
+## 7. Power Management (PM)
+
+> 💭 **My PM Mental Model**
+>
+> Power management spans four cooperating domains:
+> 1. **System state management** orchestrates whole-platform states (Sleep, Hibernate, Shutdown etc). When the policy manager initiates one of these transitions, every device driver must honor the requested system state or explicitly veto it, otherwise the transition stalls.
+> 2. **Device state management** lets peripherals drop to lower-power modes even while the system stays active, typically via system-managed PM hooks or runtime PM refcounts.
+> 3. **Processor performance/state management** treats CPUs as special devices: while active (ACPI C0) they can shift performance via P-states, and when idle they entry/exit architectural C-states through Zephyr’s idle + CPU frequency subsystems.
+> 4. **Thermal & power limit enforcement** cuts across all layers. Thermal trips may force a system suspend/shutdown, while board-level power governors can throttle CPUs or devices despite their local policies.
+>
+> Keeping these domains conceptually separate helps map Zephyr’s modular APIs (system PM core, device PM, CPU freq/SMP idle, thermal inputs) to the real-world triggers that drive them.
 
 Interfaces and APIs in Zephyr's PM stack are intentionally SoC-agnostic: the core framework exposes uniform hooks to the kernel and applications, while SoC-specific code plugs in the actual state transitions, residency data, and wake-up plumbing. That split keeps higher layers portable even when the underlying silicon has wildly different sleep modes.
 
 ### 7.1 System Power Management
 Reference: [System PM docs](https://docs.zephyrproject.org/latest/services/pm/system.html)
 
-1. **Kernel idle flow:** When the scheduler has nothing runnable and `CONFIG_PM` is enabled, the kernel enters idle and asks the PM subsystem to suspend for a requested duration. The policy manager compares that time window against each supported power state and picks the best fit, then restores execution when the wake event fires.
-2. **Wake-up events:** Applications are responsible for provisioning at least one interrupt-capable wake source (RTC, counter, GPIO, modem peripheral, etc.). Availability depends on the SoC and the chosen state, so confirm which peripherals remain powered before relying on them.
-3. **Key concepts:**
-   - **Power states (`pm_state`):** Each state specifies power draw, context retention, and exit latency (see API docs for authoritative definitions). Quick reference:
+#### 7.1.1 Layered View & Coordination
+- **Application layer:**
+  - Registers deadlines through `pm_policy_event_register()` and can block specific system states via `pm_policy_state_lock_get()` / `pm_policy_state_lock_put()` so long as the locks are released once the critical section ends.
+  - Can supply a custom policy callback (application-based mode) that overrides the default residency engine whenever it returns a target state.
+- **Kernel / idle thread:**
+  - When the scheduler goes idle (no runnable work), the idle thread asks the PM policy which `pm_state` to enter.
+  - The default residency policy computes `next_scheduled_event` by combining kernel-managed timeouts (next timer, sleep, or delayed work) with any registered application deadlines. It then selects the deepest state whose minimum residency plus exit latency fits before that deadline.
+  - If the application provides a policy callback, the kernel simply forwards the computed `next_scheduled_event` and obeys the callback’s chosen state; the residency engine is bypassed.
 
-     | State | Power/Retention Summary | Resume Notes & Analogy |
-     | --- | --- | --- |
-     | `PM_STATE_ACTIVE` | Fully powered system; CPUs + peripherals running. | Immediate resume; baseline run state (ACPI G0/S0).
-     | `PM_STATE_RUNTIME_IDLE` | CPUs drop into deepest idle, devices stay in their current states. | Fast wake; similar to ACPI S0ix for short naps.
-     | `PM_STATE_SUSPEND_TO_IDLE` | All cores idle and many peripherals clock-gated, but CPU context retained. | Straight-line resume without reinit (ACPI S1).
-     | `PM_STATE_STANDBY` | Non-boot CPUs powered off, remaining logic and peripherals in deeper savings. | Higher latency than suspend-to-idle; maps to ACPI S2.
-     | `PM_STATE_SUSPEND_TO_RAM` | DRAM in self-refresh, most silicon off; CPU/device context saved in RAM. | Requires boot ROM assist before kernel resumes (ACPI S3).
-     | `PM_STATE_SUSPEND_TO_DISK` | RAM contents flushed to NVM; virtually all power removed. | Wake copies state back from storage before continuing (ACPI S4).
-     | `PM_STATE_SOFT_OFF` | Minimal leakage; no CPU/RAM context retained. | Cold boot path (ACPI G2/S5).
+#### 7.1.2 End-to-End Flow
+1. **Idle entry:** Scheduler finds no runnable threads, so the idle thread runs with `CONFIG_PM` enabled.
+2. **Deadline gathering:**
+   - Kernel determines the earliest internal timeout.
+   - Applications/subsystems optionally inject deadlines via `pm_policy_event_register()`.
+   - The minimum of those values becomes `next_scheduled_event`.
+3. **Policy decision:**
+   - Residency mode: choose the deepest `pm_state` whose `min_residency + exit_latency <= time_until(next_scheduled_event)`.
+   - Application mode: invoke the registered callback with `next_scheduled_event`; the callback returns the desired `pm_state` (or `PM_STATE_ACTIVE` to skip entry).
+4. **State locks:** Before committing, the kernel checks whether `pm_policy_state_lock_get()` (and DT constraints) forbid the candidate state. If locked, it backs off to the next shallower level.
+5. **Transition + wake:** The SoC-specific backend executes the transition. A wake event or timeout brings the CPU back to active state and resumes normal scheduling.
 
-   - **Power policy manager:** Decides which state to enter based on availability, residency, and latency constraints.
-     - *Residency-based mode* (default): choose the deepest state whose `min_residency + exit_latency` fits within the kernel’s requested suspend time.
-     - *Application-defined mode*: implement `pm_policy_next_state()` to select states using custom heuristics.
-   - **State locks/constraints:** APIs such as `pm_policy_state_lock_get()` and DT-defined constraints let drivers/applications block unsafe states (e.g., while DMA or networking is active).
+#### 7.1.3 Key Takeaways
+- System PM only evaluates states when the idle thread runs; if work is pending, no state transition occurs.
+- Residency policy balances two clocks: kernel-owned timers and app-specified deadlines. There is currently **no API for apps to declare an exit-latency requirement**, so they must use deadlines/state locks to guard critical sections.
+- Applications can block unwanted transitions entirely by calling `pm_policy_state_lock_get()`; the lock stays in effect until `pm_policy_state_lock_put()` releases it, so ensure every acquisition is matched with a release once the critical section ends.
+- Application policies can completely override residency heuristics, enabling product-specific heuristics (battery level, thermal trips, etc.) while reusing the same kernel plumbing.
+- Wake sources remain an application responsibility—ensure at least one interrupt-capable source stays powered for every low-power state you plan to enter.
+
+#### 7.1.4 Key Macros, Data Structures & Callbacks
+- **`CONFIG_PM`** – master Kconfig switch enabling the system PM framework and idle policy hooks.
+- **`pm_state` / `struct pm_state_info`** – enumerations + metadata (min residency, exit latency) describing each platform-supported system state. Quick reference of built-in targets:
+
+  | State | Resume Analogy | Notes |
+  | --- | --- | --- |
+  | `PM_STATE_ACTIVE` | ACPI G0/S0 | Baseline run state. |
+  | `PM_STATE_RUNTIME_IDLE` | ACPI S0ix | CPU idle, devices unchanged. |
+  | `PM_STATE_SUSPEND_TO_IDLE` | ACPI S1 | Context retained; clocks gated. |
+  | `PM_STATE_STANDBY` | ACPI S2 | Non-boot CPUs off; longer latency. |
+  | `PM_STATE_SUSPEND_TO_RAM` | ACPI S3 | DRAM self-refresh; boot ROM assist on resume. |
+  | `PM_STATE_SUSPEND_TO_DISK` | ACPI S4 | RAM persisted to NVM; near-complete power loss. |
+  | `PM_STATE_SOFT_OFF` | ACPI G2/S5 | Cold boot required. |
+- **`pm_policy_state_lock_get()` / `_put()`** – per-state lock API that applications or drivers use to veto specific transitions during sensitive operations.
+- **`pm_policy_event_register()`** – lets apps inject “wake by” deadlines into the residency engine so latency-sensitive work is not delayed.
+- **`pm_policy_next_state()`** (optional override) – application-supplied callback that replaces the residency engine when custom logic needs full control.
 
 ### 7.2 Device Power Management
 Reference: [Device PM docs](https://docs.zephyrproject.org/latest/services/pm/device.html)
@@ -670,6 +705,40 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
 2. Sensor A becomes idle and calls `pm_device_runtime_put()`. Its usage drops to 0, but B is still active, so the domain’s refcount stays at 1 and power remains applied.
 3. When sensor B also calls `pm_device_runtime_put()`, the domain refcount hits 0. The power-domain driver suspends, shuts the rail off, and sends `PM_DEVICE_ACTION_TURN_OFF` to both sensors. The next `get()` from either sensor automatically powers the rail back up.
 
+#### 7.2.4 Resource Management (On-Off Manager)
+
+##### 7.2.4.1 Concept & Purpose
+- The Resource Management (RM) On-Off Manager is a lightweight coordination primitive for any binary resource (ON/OFF plus transition/Error states) with multiple clients.
+- It centralizes refcounting, asynchronous transitions, error recovery, and optional notifications so drivers/services can reuse a proven state machine instead of rolling custom logic.
+- Each resource owner supplies callbacks to start/stop/reset the underlying hardware or service; RM orchestrates when to invoke them based on client demand.
+
+##### 7.2.4.2 Core Model & Operations
+- **States:** `off`, `on`, `error`, and “transition in progress.”
+- **Client APIs:**
+  - `onoff_request()` increments the refcount; a 0→1 transition triggers the owner’s `start` callback (sync or async via Zephyr’s async notification helpers).
+  - `onoff_release()` decrements the refcount; a 1→0 transition triggers `stop`.
+  - `onoff_reset()` recovers from `error` back to `off`.
+  - `onoff_cancel()` lets a client abandon a pending request, but it does **not** abort the underlying transition—only the resource owner decides that.
+- RM tracks **only counts**, not which client owns which request, so callers must know whether their request succeeded before issuing `release()`.
+
+##### 7.2.4.3 RM vs Device Power Management
+- **Device PM** operates on `struct device`, integrates tightly with system power states/power domains, and uses `pm_device_runtime_get/put()` plus `pm_device_action_t` callbacks.
+- **RM/On-Off** is agnostic to the device model and can guard any logical resource (clock, rail, service) whether or not it is a Zephyr device. It has zero implicit knowledge of system PM or Devicetree metadata.
+- Practical heuristic: *Device PM* handles framework-managed devices that participate in global power policy; *RM* provides a reusable on/off + refcount engine you can embed anywhere, including inside a Device PM callback if that helps structure the driver.
+
+##### 7.2.4.4 When to Use Which
+- **Reach for RM when:**
+  - You need to share a binary resource (internal PLL, shared regulator, “turbo mode” flag, logging backend) among several clients without building a full device.
+  - Enable/disable sequences might be asynchronous and you want standardized completion signaling.
+  - You prefer a compact helper to manage refcounts, retries, and error recovery.
+- **Stick with Device PM when:**
+  - The resource is already a first-class Zephyr device and must honor system-level sleep, power domains, and `pm_device_state` semantics.
+
+##### 7.2.4.5 Practical Notes
+- RM callbacks may run in interrupt context if clients make requests there, so they should be non-blocking or offload heavy work.
+- Monitoring hooks can observe transitions or failures, enabling logging or watchdog-style resets without tightly coupling to the resource owner.
+- Because RM and Device PM are orthogonal, it’s common to see RM manage an internal sub-resource while the encompassing Device PM handler coordinates with the rest of the system.
+
 ### 7.3 CPU Frequency Scaling
 
 #### 7.3.1 Key Terms
@@ -697,3 +766,4 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
 - Automatic scaling only happens if a policy (or application code) actively requests changes; otherwise the CPU remains at the initial P-state.
 - Metrics are pluggable: any signal measurable in kernel context—performance counters, thermal sensors, workload hints—can feed into the policy.
 - Align policy timer context with driver requirements: since `cpu_freq_pstate_set()` must be IRQ-safe, lightweight policies can run directly from the subsystem timer, while heavier analytics should defer work to a thread before invoking the driver.
+
