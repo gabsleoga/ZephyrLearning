@@ -657,40 +657,75 @@ Reference: [System PM docs](https://docs.zephyrproject.org/latest/services/pm/sy
 Reference: [Device PM docs](https://docs.zephyrproject.org/latest/services/pm/device.html)
 
 #### 7.2.1 System-Managed Device PM
-- **Enablement:** Requires `CONFIG_PM_DEVICE=y` and `CONFIG_PM_DEVICE_SYSTEM_MANAGED=y`. For a given CPU power state, the PM core only runs device callbacks if that state’s Devicetree node omits the `zephyr,pm-device-disabled` flag.
-- **Eligibility:** A device participates when (1) it initialized successfully and lives on the global device list, (2) its driver implements `pm_device_action_t` callbacks, and (3) it is not exclusively controlled by runtime PM.
-- **Suspend/resume flow:** After the system PM policy selects a low-power CPU state, the framework walks devices in initialization order, calling `PM_DEVICE_ACTION_SUSPEND`, then enters the SoC sleep state. Upon wake, devices resume in reverse order via `PM_DEVICE_ACTION_RESUME`.
-- **Blocking entry:** A single device can veto the transition by returning an error (commonly `-EBUSY`) from its suspend callback. With `CONFIG_PM_NEED_ALL_DEVICES_IDLE=y`, any device that previously called `pm_device_busy_set()` keeps the system active until it clears the busy flag.
-- **Callback constraints:** Suspend/resume handlers may run in the idle thread context, so they must remain non-blocking—avoid sleeping APIs unless you first check `k_can_yield()` and offload work elsewhere.
-- **Usage notes:** Best for hardware that simply mirrors SoC sleep/wake without independent policies and can quiesce immediately. For general-purpose devices needing fine-grained control or blocking operations, Zephyr recommends adopting device runtime PM instead of the system-managed approach.
+
+#### 7.2.1.1 Layered View & Coordination
+- **Policy core:** Enabled with `CONFIG_PM_DEVICE` + `CONFIG_PM_DEVICE_SYSTEM_MANAGED`. When the system PM policy chooses a low-power CPU state (and the state’s DT node doesn't specify `zephyr,pm-device-disabled`), the core sequences every eligible device, honoring `CONFIG_PM_NEED_ALL_DEVICES_IDLE` before entering the state.
+- **Device drivers:** Opt in by supplying a `pm_device_action_t` callback when defining the device. Drivers may flag ongoing work via `pm_device_busy_set()` so the policy waits before suspending them.
+- **Applications:** Normally stay hands-off; their role is indirect—busy refcounts from drivers and state vetoes keep the platform awake if critical work is running. Apps can still monitor results (e.g., logging) but should not micromanage suspend/resume in this mode.
+
+#### 7.2.1.2 End-to-End Flow
+1. **Eligibility pass:** During boot, devices that initialized successfully and expose `pm_device_action_t` are enrolled for system-managed PM unless runtime PM has exclusive control.
+2. **State selection:** Scheduler idles (meaning every CPU’s idle thread is running because no runnable work remains), so the system PM policy picks a target CPU state. If `CONFIG_PM_NEED_ALL_DEVICES_IDLE=y`, the policy verifies no device has an outstanding busy flag.
+3. **Suspend walk:** Devices are traversed in initialization order, each receiving `PM_DEVICE_ACTION_SUSPEND`. Any device may abort the transition by returning an error (commonly `-EBUSY`).
+4. **CPU state entry:** If all devices suspend cleanly, the SoC enters the selected sleep state.
+5. **Resume walk:** On wake, devices resume in reverse order via `PM_DEVICE_ACTION_RESUME`, after which normal scheduling resumes.
+
+#### 7.2.1.3 Key Takeaways
+- Designed for “follow the system” peripherals that can mirror SoC sleep/wake with minimal logic; anything requiring bespoke timing should migrate to runtime PM instead.
+- Suspend/resume callbacks run in idle-thread context, so keep them non-blocking or offload heavy work after checking `k_can_yield()`.
+- A single device can veto entry either by returning an error from the suspend callback or by leaving a busy flag set; be disciplined about clearing `pm_device_busy_set()` once the protected transaction ends.
+- Devicetree gates participation per state via `zephyr,pm-device-disabled`, letting you keep particular low-power modes from touching fragile hardware.
+
+#### 7.2.1.4 Key Macros, Data Structures & Callbacks
+- **`CONFIG_PM_DEVICE`, `CONFIG_PM_DEVICE_SYSTEM_MANAGED`** – enable the framework and tie device sequencing to system PM states.
+- **`pm_device_action_t`** – driver-provided callback invoked with actions such as `PM_DEVICE_ACTION_SUSPEND`, `RESUME`, `TURN_OFF`, etc.
+- **`pm_device_busy_set()` / `pm_device_busy_clear()`** – let a driver declare in-progress work so the system policy delays low-power entry until cleared (requires `CONFIG_PM_NEED_ALL_DEVICES_IDLE`).
+- **Devicetree `zephyr,pm-device-disabled` property** – opt-out toggle on individual low-power states to prevent the PM core from touching devices when that state is selected.
 
 #### 7.2.2 Runtime Device PM
-- **Enablement:** Turn on `CONFIG_PM_DEVICE_RUNTIME`. You can globally enable runtime PM with `CONFIG_PM_DEVICE_RUNTIME_DEFAULT_ENABLE`, mark specific devices with the `zephyr,pm-device-runtime-auto` DT property, or call `pm_device_runtime_enable()` per device.
-- **Driver responsibility:** Drivers call `pm_device_runtime_get()` / `pm_device_runtime_put()` (or `_async`) to bump their usage counts whenever they need hardware powered, independent of the current system power state. Applications do not directly suspend/resume devices but may enable/disable runtime PM for them.
-- **State machine:** Devices start in `PM_DEVICE_STATE_SUSPENDED`. First `get()` resumes the hardware (`PM_DEVICE_STATE_ACTIVE`). When the usage count drops to zero, the device transitions back to suspended—either synchronously or via a `PM_DEVICE_STATE_SUSPENDING` intermediate state for async work.
+Reference: [Device runtime PM docs](https://docs.zephyrproject.org/latest/services/pm/device_runtime.html)
 
-- **Power domains:** ❓ *Open question*—docs state that devices under a DT `power-domains` node automatically request/release the parent domain on runtime `get()`/`put()`. Need to study Zephyr power-domain support to confirm sequencing and constraints before relying on this behavior.
-- **Best practices:** Keep suspend/resume callbacks short; defer lengthy work to a thread if `pm_device_runtime_put_async()` is used. Favor runtime PM for peripherals that make autonomous power decisions (e.g., sensors, radios) regardless of system-wide sleep states.
+##### 7.2.2.1 Layered View & Coordination
+- **Applications & subsystems:** Invoke their usual functional APIs (e.g. `sensor_sample_fetch()`) and can optionally enable/disable runtime PM per device by the driver, but applications are not supposed to call `pm_device_runtime_get()/put()` directly.
+- **Runtime PM core:** Enabled through `CONFIG_PM_DEVICE_RUNTIME`, it tracks each device’s usage count, owns the `PM_DEVICE_STATE_*` state machine, and issues `PM_DEVICE_ACTION_*` when reference counts cross 0 ↔ 1. It also propagates requests to parent power domains when the child declares `power-domains` in Devicetree.
+- **Device drivers:** Register a `pm_device_action_t` handler, call `pm_device_runtime_enable()` (manually or via the `zephyr,pm-device-runtime-auto` flag), wrap hardware access in `pm_device_runtime_get()/put()` (sync or async), and decide when autosuspend delays are appropriate.
 
-##### Runtime PM Roles & Responsibilities
-1. **Application layer**
-  - Calls driver/subsystem functional APIs such as `sensor_sample_fetch()` or `uart_tx()` without touching PM directly.
-  - May offer hints about expected idle windows, but in a clean design it never invokes `pm_device_runtime_get()/put()` itself.
-2. **Runtime PM core**
-  - Provides APIs like `pm_device_runtime_get()`, `pm_device_runtime_put()`, and their async/delayed variants.
-  - Maintains each device’s usage refcount and drives the official PM state machine (`PM_DEVICE_STATE_ACTIVE`, `SUSPENDING`, `SUSPENDED`, etc.).
-  - On a 0 → 1 refcount transition it issues `PM_DEVICE_ACTION_RESUME` (plus `TURN_ON` when a power domain is involved) before marking the device ACTIVE.
-  - When the refcount returns to zero it marks the device eligible for low power, runs any autosuspend policy (immediate or delayed), transitions through `SUSPENDING`, and calls `PM_DEVICE_ACTION_SUSPEND` so the driver ends in `PM_DEVICE_STATE_SUSPENDED` or OFF if power domains participate.
-3. **Device driver / subsystem**
-  - Wraps every hardware-touching API with `pm_device_runtime_get()` before use and `pm_device_runtime_put()` afterward so the PM core knows when the hardware is busy.
-  - Uses `pm_device_runtime_put_async(dev, delay)` to request autosuspend after a grace period when immediate suspend would thrash performance.
-  - Implements the `pm_device_action_t` callback to translate core actions into register writes, clock enables, or regulator toggles for that peripheral.
+##### 7.2.2.2 End-to-End Flow
+1. **Enable runtime PM:** During init, the driver calls `pm_device_runtime_enable()` (optionally after `pm_device_init_suspended()` if the hardware already sits in low power). Boards can globally default to enabled via `CONFIG_PM_DEVICE_RUNTIME_DEFAULT_ENABLE` or per-node with `zephyr,pm-device-runtime-auto`.
+2. **Client requests hardware:** Before touching registers, the driver invokes `pm_device_runtime_get()`. A 0 → 1 transition triggers `PM_DEVICE_ACTION_RESUME`, bringing the device to `PM_DEVICE_STATE_ACTIVE`.
+3. **Work completion:** After the operation, the driver calls `pm_device_runtime_put()` to decrement the usage count immediately, or `pm_device_runtime_put_async(dev, delay)` to defer suspension by a grace period.
+4. **Suspend transition:** When the refcount reaches zero, the core marks the device `PM_DEVICE_STATE_SUSPENDING` (async path) or directly `PM_DEVICE_STATE_SUSPENDED` (sync path) and issues `PM_DEVICE_ACTION_SUSPEND`. The resume/suspend callbacks run serially in the runtime PM work context.
+5. **Interaction with system PM:** Once runtime PM is enabled on a device, system-managed PM stops touching it during CPU low-power entry. The device’s availability is therefore controlled entirely by its runtime refcount, which shortens system suspend/resume because the idle thread no longer has to walk those drivers.
 
-##### Design Principles & Flow
-- Runtime-managed devices are isolated from system PM transitions: once runtime PM is enabled, they are no longer suspended/resumed automatically during CPU low-power entry—they depend solely on driver `get()/put()` calls.
-- `pm_device_runtime_get()` and `pm_device_runtime_put()` are blocking operations that adjust the usage count and, when crossing 0/1, invoke `PM_DEVICE_ACTION_RESUME/SUSPEND` as shown in the flow diagram above. Long suspend/resume handlers therefore add latency to the caller.
-- To avoid blocking the caller, drivers can use `pm_device_runtime_put_async()`, but must ensure the work runs in a context that tolerates suspension latency. By default these async operations execute on the system workqueue, so suspend handlers must not block and thereby stall other system work. Set `CONFIG_PM_DEVICE_RUNTIME_USE_DEDICATED_WQ=y` to move runtime PM work to its own queue when blocking is unavoidable.
-- If asynchronous support is unnecessary (or memory-constrained), disable it via `CONFIG_PM_DEVICE_RUNTIME_ASYNC=n` to reduce complexity once all drivers rely on synchronous paths.
+##### 7.2.2.3 Key Takeaways
+- Runtime PM is reference-counted: every successful `pm_device_runtime_get()` must be paired with a `put()` (sync or async). Forgetting to `put()` pins the hardware on; extra `put()` calls can suspend hardware mid-transaction.
+- Driver callbacks must stay non-blocking unless you move runtime PM work off the system workqueue via `CONFIG_PM_DEVICE_RUNTIME_USE_DEDICATED_WQ` or set `CONFIG_PM_DEVICE_DRIVER_NEEDS_DEDICATED_WQ` for that driver.
+- The runtime PM core does **not** automatically manage arbitrary parent/child dependencies—drivers must `get()/put()` their dependencies-drivers manually.
+- Runtime-managed devices are invisible to system-managed PM transitions, which is why Zephyr recommends runtime PM for anything that needs bespoke timing or long-lived wakeups; system-managed PM should only cover “follow the SoC” peripherals.
+- Autosuspend (`pm_device_runtime_put_async()` with a delay) prevents thrashing on chatty peripherals but still funnels through the runtime PM workqueue, so treat suspend handlers like workqueue callbacks: avoid blocking and offload heavy operations elsewhere when possible.
+
+##### 7.2.2.4 Key Macros, Data Structures & Callbacks
+- **Kconfig switches:** `CONFIG_PM_DEVICE_RUNTIME` (master enable), `CONFIG_PM_DEVICE_RUNTIME_DEFAULT_ENABLE` (enable all devices by default), `CONFIG_PM_DEVICE_RUNTIME_ASYNC` (allow async put paths), `CONFIG_PM_DEVICE_RUNTIME_USE_DEDICATED_WQ` / `CONFIG_PM_DEVICE_DRIVER_NEEDS_DEDICATED_WQ` (move runtime PM work off the system queue when suspend/resume must block).
+- **Devicetree hooks:** `zephyr,pm-device-runtime-auto` auto-enables runtime PM right after init.
+- **APIs:** `pm_device_runtime_enable()/disable()` flip runtime PM at runtime, `pm_device_init_suspended()` advertises that the hardware already booted in a low-power state, `pm_device_runtime_get()/put()` implement the synchronous refcounting path, and `pm_device_runtime_put_async()` schedules deferred suspension. All callbacks funnel into the driver’s `pm_device_action_t` handler, which must handle `PM_DEVICE_ACTION_RESUME/SUSPEND/TURN_ON/TURN_OFF` to reflect the requested state in hardware.
+ - **Key enum reference:**
+
+   | `pm_device_action` value | When the core issues it | Driver expectation |
+   | --- | --- | --- |
+   | `PM_DEVICE_ACTION_RESUME` | Refcount rises from 0 → 1 (or policy explicitly wakes the device). | Re-enable clocks/IRQs, restore registers, make hardware usable, then return 0.
+   | `PM_DEVICE_ACTION_SUSPEND` | Refcount drops to 0 and no autosuspend delay is pending. | Flush in-flight work, gate clocks, put hardware into its low-power state.
+   | `PM_DEVICE_ACTION_TURN_ON` | Power domain or SoC backend just supplied power before drivers run. | Perform any power-on initialization required before the device can resume.
+   | `PM_DEVICE_ACTION_TURN_OFF` | Domain/policy is about to remove power entirely. | Save context (if possible) and place hardware in a safe, power-loss-tolerant state.
+
+   | `pm_device_state` value | Meaning | Who sets it |
+   | --- | --- | --- |
+   | `PM_DEVICE_STATE_ACTIVE` | Device is fully usable and clocked. | Driver returns success from RESUME/TURN_ON handlers.
+   | `PM_DEVICE_STATE_LOW_POWER` | Device is in a vendor-defined retention state but can wake quickly. | Drivers that support intermediate modes set this via `pm_device_runtime_set_state()`.
+   | `PM_DEVICE_STATE_SUSPENDED` | Hardware context retained but interface quiesced; waits for resume. | Runtime PM core after a successful SUSPEND.
+   | `PM_DEVICE_STATE_OFF` | Rails removed; only a full TURN_ON restores operation. | Core after TURN_OFF completes.
+   | `PM_DEVICE_STATE_SUSPENDING` / `PM_DEVICE_STATE_RESUMING` | Transitional markers while suspend/resume work is in-flight (mainly async puts). | Runtime PM core while dispatching workqueue jobs.
+   | `PM_DEVICE_STATE_TURNING_ON` / `PM_DEVICE_STATE_TURNING_OFF` | Transitional markers while domain power is changing. | Runtime PM or power-domain core coordinating dependencies.
+   | `PM_DEVICE_STATE_ERROR` | Last PM operation failed; framework will stop issuing new ones until recovered. | Runtime PM core when a callback returns failure; driver should log and attempt recovery before re-enabling runtime PM.
 
 #### 7.2.3 Power Domains
 Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm/power_domain.html)
