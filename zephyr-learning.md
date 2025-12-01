@@ -108,7 +108,6 @@ The Zephyr build process consists of two main phases:
          clock-frequency:
            type: int
      ```
-
 ### 2.2 Key Features
 - Build System Processing:
   - Validates node properties against binding schema
@@ -235,7 +234,6 @@ Beyond main and idle threads, Zephyr creates additional system threads based on 
 - **Logging Thread**: Process log messages asynchronously
 - **Shell Thread**: Handle shell command processing
 - **Network Threads**: Handle network stack processing (RX thread, TX thread, management thread)
-  - 📝 **TODO:** Document shell/log thread stack requirements once sizing guidance is finalized.
 
 ##### 3.1.6.5 Key Characteristics
 - **Automatic creation**: Applications don't create these threads
@@ -524,8 +522,6 @@ Workqueues provide a mechanism for deferring work execution to a dedicated threa
       LOG_INF("Init complete (clk=%u Hz)", SystemCoreClock);
   }
   ```
-- 📝 **TODO:** Document how `CONFIG_LOG_PROCESS_THREAD_STACK_SIZE` scales with enabled backends once sizing data is collected.
-
 ### 6.3 Shell Service
 - `CONFIG_SHELL` launches a shell thread that pulls commands from UART, RTT, or Bluetooth transports; each transport is configured via `CONFIG_SHELL_BACKEND_*` options.
 - Commands are registered with `SHELL_CMD_REGISTER()` or `SHELL_STATIC_SUBCMD_SET_CREATE()`, producing a hierarchical command tree with built-in help.
@@ -631,11 +627,38 @@ Reference: [System PM docs](https://docs.zephyrproject.org/latest/services/pm/sy
 5. **Transition + wake:** The SoC-specific backend executes the transition. A wake event or timeout brings the CPU back to active state and resumes normal scheduling.
 
 #### 7.1.3 Key Takeaways
-- System PM only evaluates states when the idle thread runs; if work is pending, no state transition occurs.
-- Residency policy balances two clocks: kernel-owned timers and app-specified deadlines. There is currently **no API for apps to declare an exit-latency requirement**, so they must use deadlines/state locks to guard critical sections.
-- Applications can block unwanted transitions entirely by calling `pm_policy_state_lock_get()`; the lock stays in effect until `pm_policy_state_lock_put()` releases it, so ensure every acquisition is matched with a release once the critical section ends.
-- Application policies can completely override residency heuristics, enabling product-specific heuristics (battery level, thermal trips, etc.) while reusing the same kernel plumbing.
-- Wake sources remain an application responsibility—ensure at least one interrupt-capable source stays powered for every low-power state you plan to enter.
+1. **Entry point: System PM only evaluates states when the idle thread runs; if work is pending, no state transition occurs. → `pm_system_suspend()`**
+   - When the kernel has nothing to schedule on a CPU, it runs that CPU’s idle thread.
+   - With `CONFIG_PM` enabled, the idle thread calls `pm_system_suspend()` to choose a power state for that CPU, based on the time until the next scheduled event.
+   - On SMP, `pm_system_suspend()` runs independently on each core; **system-managed device PM** is coordinated so that devices are suspended only when the last active core goes idle, and resumed by the first core that wakes.
+
+2. **Policy: built-in residency or application-defined**
+   - The PM policy manager decides which `pm_state` to use:
+     - **Residency policy**: pick the deepest state whose `min-residency-us + exit-latency-us` fits within the idle time budget.  
+     - **Application policy**: the app implements `pm_policy_next_state()` and can choose any allowed state.
+   - Optional: `pm_state_force(cpu, info)` can override policy and force a specific state for the next idle on a given CPU.
+
+3. **Constraints: chosen state may be downgraded or rejected**
+   - The state returned by the policy is filtered by:
+     - **State locks** (`pm_policy_state_lock_get/put`) that disallow specific power states or all substates.
+     - Latency and other constraints baked into the policy.
+     - Device-PM viability: e.g. a device returning `-EBUSY` on SUSPEND, or `CONFIG_PM_NEED_ALL_DEVICES_IDLE` with a busy device.
+   - If no low-power state is allowed after constraints, the effective state becomes `PM_STATE_ACTIVE`, and `pm_system_suspend()` falls back to `k_cpu_idle()` with **no SoC power transition**.
+
+4. **System-managed device PM (if enabled)**
+   - If the final state **triggers device PM** (its power-state node does not have `zephyr,pm-device-disabled`), and this CPU is effectively the **last active core**:
+     - `pm_system_suspend()` calls `pm_suspend_devices()` before changing the SoC state.
+       - Devices are visited in init order.
+       - Devices that are busy, wakeup-enabled, or runtime-PM-enabled are skipped.
+       - For each applicable device, the PM subsystem calls the driver’s `pm_device_action_cb_t` via `pm_device_action_run(..., PM_DEVICE_ACTION_SUSPEND)`.
+   - On wakeup, when the **first core** becomes active, `pm_resume_devices()` runs and calls `PM_DEVICE_ACTION_RESUME` on those devices in reverse order.
+   - Devices using **runtime device PM** are not suspended/resumed by this path; their D-state is managed independently by the runtime-PM framework.
+
+5. **CPU / SoC low-power call: `pm_state_set()`**
+   - If the final effective state for this CPU is **non-ACTIVE**, `pm_system_suspend()` calls the SoC hook:
+     - `pm_state_set(z_cpus_pm_state[cpu_id]);`
+   - This is where the SoC-specific code actually enters the configured CPU/SoC low-power state (C-state, standby, suspend-to-RAM, etc.).
+   - If the final state is `PM_STATE_ACTIVE` (or device PM prevented entry), `pm_state_set()` is **not** called; the idle path simply executes `k_cpu_idle()` instead.
 
 #### 7.1.4 Key Macros, Data Structures & Callbacks
 - **`CONFIG_PM`** – master Kconfig switch enabling the system PM framework and idle policy hooks.
@@ -657,7 +680,49 @@ Reference: [System PM docs](https://docs.zephyrproject.org/latest/services/pm/sy
 ### 7.2 Device Power Management
 Reference: [Device PM docs](https://docs.zephyrproject.org/latest/services/pm/device.html)
 
-> 📝 **TODO:** Add a clarifying paragraph that the **device power state** (`pm_device_state`) is PM-core-owned bookkeeping, while **device power actions** (`pm_device_action_t`) are requests dispatched to drivers; the core updates the state during/after issuing the matching action so drivers never mutate the state directly.
+From the device’s perspective, there are **two main ways** its power state is managed:
+
+1. **System-managed device PM**
+   - Device power is driven by **system power state transitions**.
+   - When the system enters/exits certain `pm_state`s (those that *do not* have `zephyr,pm-device-disabled`):
+     - System PM calls `pm_suspend_devices()` / `pm_resume_devices()` as part of `pm_system_suspend()` / resume.
+     - Each eligible device gets its driver PM callback invoked via:
+       - `PM_DEVICE_ACTION_SUSPEND` / `PM_DEVICE_ACTION_RESUME`
+       - Optionally `PM_DEVICE_ACTION_TURN_OFF` / `PM_DEVICE_ACTION_TURN_ON` if supported.
+   - This path is tied to **idle-driven system PM** and, on SMP, coordinated with **last-core suspend / first-core resume**:
+     - Devices are suspended only when the last active core is entering the target state.
+     - Devices are resumed when the first core becomes active again.
+
+2. **Runtime (RT) device PM**
+   - Device power is driven by **usage (refcount)** while the system is otherwise “active”.
+   - Typical pattern:
+     - `pm_device_runtime_get(dev)` / `pm_device_runtime_put(dev)` adjust a usage count.
+     - When the count crosses `0 ↔ 1`, the runtime PM core triggers a device power transition:
+       - `0 → 1` → device is resumed (ACTIVE).
+       - `1 → 0` → device is suspended (SUSPEND), possibly after an autosuspend delay.
+   - This is **independent of system sleep**; it’s about saving energy when the system is running but the device is idle.
+   - Devices with runtime PM enabled are **skipped** by system-managed device PM in `pm_suspend_devices()` / `pm_resume_devices()`; their D-state is controlled purely by runtime PM.
+
+3. **Shared mechanism (how drivers see it)**
+   - Both system-managed and runtime device PM use the **same driver hook**:
+     - The driver registers a `pm_device_action_cb_t` callback (via `PM_DEVICE_DT_*` macros).
+     - The PM subsystem calls this callback with an `enum pm_device_action`:
+       - e.g. `PM_DEVICE_ACTION_SUSPEND`, `PM_DEVICE_ACTION_RESUME`, etc.
+   - In both cases, **all transitions are initiated by the PM subsystem**, not by the driver:
+     - **Device power state** (`enum pm_device_state`) is **PM-core-owned bookkeeping**.
+     - **Device power actions** (`enum pm_device_action`) are **requests dispatched to drivers**.
+   - The core:
+     - Decides which action to issue (based on system PM or runtime PM triggers).
+     - Calls the driver’s PM callback with the corresponding `PM_DEVICE_ACTION_*`.
+     - Updates the stored `pm_device_state` during/after the action.
+   - Drivers:
+     - Implement the behavior for each action (gate clocks, disable/enable IRQs, save/restore registers, etc.).
+     - **Never mutate `pm_device_state` directly**; they respond to actions, while the PM core owns the state machine.
+
+> At 10k ft:
+> - **System-managed PM**: *“device follows system sleep/wake transitions.”*  
+> - **Runtime PM**: *“device follows its own usage (refcount) during normal runtime.”*  
+> Both rely on the same PM callback; they differ only in **what triggers** the transitions.
 
 #### 7.2.1 System-Managed Device PM
 
@@ -684,9 +749,6 @@ Reference: [Device PM docs](https://docs.zephyrproject.org/latest/services/pm/de
 - **`pm_device_action_t`** – driver-provided callback invoked with actions such as `PM_DEVICE_ACTION_SUSPEND`, `RESUME`, `TURN_OFF`, etc.
 - **`pm_device_busy_set()` / `pm_device_busy_clear()`** – let a driver declare in-progress work so the system policy delays low-power entry until cleared (requires `CONFIG_PM_NEED_ALL_DEVICES_IDLE`).
 - **Devicetree `zephyr,pm-device-disabled` property** – opt-out toggle on individual low-power states to prevent the PM core from touching devices when that state is selected.
-> 🔌 **TODO:** Document how wakeup capability flags factor into device PM: runtime-managed devices rarely rely on explicit wake configuration, but system-managed devices often need wake-enabled pins or IRQs to justify staying active (or to avoid being suspended). Clarify the APIs/DT hooks (`pm_device_wakeup_enable()`, `wakeup-source`) that keep such devices eligible during system sleep.
-
-> ⚙️ **TODO:** Spell out exactly how `pm_device_busy_set()` interacts with multi-core/system suspend: does it only skip the current `pm_suspend_devices()` pass, keep rails powered despite the target `pm_state`, or block the entire system state transition until cleared? Capture the intended behavior and compare with the current implementation.
 
 #### 7.2.2 Runtime Device PM
 Reference: [Device runtime PM docs](https://docs.zephyrproject.org/latest/services/pm/device_runtime.html)
@@ -733,9 +795,7 @@ Reference: [Device runtime PM docs](https://docs.zephyrproject.org/latest/servic
    | `PM_DEVICE_STATE_TURNING_ON` / `PM_DEVICE_STATE_TURNING_OFF` | Transitional markers while domain power is changing. | Runtime PM or power-domain core coordinating dependencies.
    | `PM_DEVICE_STATE_ERROR` | Last PM operation failed; framework will stop issuing new ones until recovered. | Runtime PM core when a callback returns failure; driver should log and attempt recovery before re-enabling runtime PM.
 
-> 🔄 **TODO:** Add a follow-on subsection that captures the runtime-vs-system PM relationship: runtime-managed devices neither block nor are suspended by system PM, yet they can still veto certain system states via Devicetree (`zephyr,disabling-power-states`). Document this orthogonality explicitly.
-
-#### 7.2.3 Idle-Driven System / Device / CPU PM Flow on SMP
+#### 7.2.3 System / Device / CPU PM Flow on SMP
 
 1. **Core becomes idle**
   - Scheduler finds no ready threads on a CPU, so that CPU’s idle thread runs and calls `pm_system_suspend(ticks_until_next_timeout)`.
@@ -766,7 +826,62 @@ Reference: [Device runtime PM docs](https://docs.zephyrproject.org/latest/servic
 9. **Return to scheduling**
   - Control flows back through the idle thread to the scheduler. Other CPUs either resume from their own `pm_state_set()` (system sleep case) or simply exit `k_cpu_idle()` if they stayed in per-CPU deep idle.
 
-#### 7.2.4 Power Domains
+#### 7.2.4 Interplay between System and Device Power States
+
+##### 7.2.4.1 System → Device
+
+- **Runtime (RT) device PM**
+  - There is **no automatic link** between system power states and a runtime-PM device.
+  - When the system enters/exits a `pm_state`, **system-managed device PM skips runtime-PM devices**:
+    - `pm_suspend_devices()` / `pm_resume_devices()` do *not* call their `PM_DEVICE_ACTION_*` callbacks.
+  - A runtime-PM device’s D-state is controlled **only** by runtime PM (refcount, autosuspend, etc.), unless the driver/app explicitly reacts to system PM events (e.g., via `pm_notifier_register()`).
+
+- **System-managed device PM**
+  - For states that **trigger device PM** (power-state node *without* `zephyr,pm-device-disabled`):
+    - On the idle path, the idle thread calls:
+      - `pm_system_suspend()` → `pm_suspend_devices()`.
+    - `pm_suspend_devices()` iterates devices and, for each eligible system-managed device, calls:
+      - `pm_device_action_run(dev, PM_DEVICE_ACTION_SUSPEND)`,
+      - which in turn invokes the driver’s PM callback.
+    - On resume, `pm_resume_devices()` calls `PM_DEVICE_ACTION_RESUME` in reverse order.
+  - On SMP, this suspend/resume happens only when:
+    - The **last core** is entering the chosen sleep state (suspend).
+    - The **first core** becomes active again (resume).
+
+##### 7.2.4.2 Device → System
+
+- **Unique to system-managed device PM**
+
+  - **EBUSY to abort system transition**
+    - If a device returns an error (e.g. `-EBUSY`) from `PM_DEVICE_ACTION_SUSPEND`:
+      - `pm_suspend_devices()` reports failure.
+      - `pm_system_suspend()`:
+        - Calls `pm_resume_devices()` to roll back any devices already suspended.
+        - Cancels the SoC low-power transition (CPU does not enter that `pm_state`).
+  
+  - **Busy flag to avoid suspension**
+    - A device can call `pm_device_busy_set(dev)` / `pm_device_busy_clear(dev)` to mark itself busy.
+    - Busy devices are **skipped** by `pm_suspend_devices()`:
+      - They are not suspended while busy.
+    - With `CONFIG_PM_NEED_ALL_DEVICES_IDLE` enabled:
+      - Having any device marked busy also prevents the CPU from entering low-power states at all via system PM.
+
+- **Mechanisms shared by system-managed and runtime-PM devices**
+
+  - **Global state locks: `pm_policy_state_lock_get()`**
+    - Any component (including code associated with a device) can call:
+      - `pm_policy_state_lock_get(state)` / `_put(state)`
+    - This prevents the system PM policy from choosing specific `pm_state` values while the lock is held.
+    - Applies regardless of whether the device itself uses system-managed or runtime PM.
+
+  - **Device-centric locks based on `zephyr,disabling-power-states`**
+    - In devicetree, a device can declare:
+      - `zephyr,disabling-power-states = <&stateX &stateY ...>;`
+      - This lists system power states in which that device’s **power is considered disabled/off**.
+    - With `CONFIG_PM_POLICY_DEVICE_CONSTRAINTS=y`, the driver (or higher-level code) can call `pm_policy_device_power_lock_get(dev)` / `_put(dev)`
+    - The PM core then locks **all** system power states listed in `zephyr,disabling-power-states` for that device, preventing the system from entering them while the lock is held.
+
+#### 7.2.5 Power Domains
 Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm/power_domain.html)
 
 - **Concept:** A power domain models a shared rail/regulator/SoC region supplying multiple devices. The domain itself is a Zephyr device; consumers reference it with `power-domains = <&domain>` in Devicetree so the kernel knows which peripherals share that rail.
@@ -779,14 +894,14 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
 2. Sensor A becomes idle and calls `pm_device_runtime_put()`. Its usage drops to 0, but B is still active, so the domain’s refcount stays at 1 and power remains applied.
 3. When sensor B also calls `pm_device_runtime_put()`, the domain refcount hits 0. The power-domain driver suspends, shuts the rail off, and sends `PM_DEVICE_ACTION_TURN_OFF` to both sensors. The next `get()` from either sensor automatically powers the rail back up.
 
-#### 7.2.5 Resource Management (On-Off Manager)
+#### 7.2.6 Resource Management (On-Off Manager)
 
-##### 7.2.5.1 Concept & Purpose
+##### 7.2.6.1 Concept & Purpose
 - The Resource Management (RM) On-Off Manager is a lightweight coordination primitive for any binary resource (ON/OFF plus transition/Error states) with multiple clients.
 - It centralizes refcounting, asynchronous transitions, error recovery, and optional notifications so drivers/services can reuse a proven state machine instead of rolling custom logic.
 - Each resource owner supplies callbacks to start/stop/reset the underlying hardware or service; RM orchestrates when to invoke them based on client demand.
 
-##### 7.2.5.2 Core Model & Operations
+##### 7.2.6.2 Core Model & Operations
 - **States:** `off`, `on`, `error`, and “transition in progress.”
 - **Client APIs:**
   - `onoff_request()` increments the refcount; a 0→1 transition triggers the owner’s `start` callback (sync or async via Zephyr’s async notification helpers).
@@ -795,12 +910,12 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
   - `onoff_cancel()` lets a client abandon a pending request, but it does **not** abort the underlying transition—only the resource owner decides that.
 - RM tracks **only counts**, not which client owns which request, so callers must know whether their request succeeded before issuing `release()`.
 
-##### 7.2.5.3 RM vs Device Power Management
+##### 7.2.6.3 RM vs Device Power Management
 - **Device PM** operates on `struct device`, integrates tightly with system power states/power domains, and uses `pm_device_runtime_get/put()` plus `pm_device_action_t` callbacks.
 - **RM/On-Off** is agnostic to the device model and can guard any logical resource (clock, rail, service) whether or not it is a Zephyr device. It has zero implicit knowledge of system PM or Devicetree metadata.
 - Practical heuristic: *Device PM* handles framework-managed devices that participate in global power policy; *RM* provides a reusable on/off + refcount engine you can embed anywhere, including inside a Device PM callback if that helps structure the driver.
 
-##### 7.2.5.4 When to Use Which
+##### 7.2.6.4 When to Use Which
 - **Reach for RM when:**
   - You need to share a binary resource (internal PLL, shared regulator, “turbo mode” flag, logging backend) among several clients without building a full device.
   - Enable/disable sequences might be asynchronous and you want standardized completion signaling.
@@ -808,10 +923,83 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
 - **Stick with Device PM when:**
   - The resource is already a first-class Zephyr device and must honor system-level sleep, power domains, and `pm_device_state` semantics.
 
-##### 7.2.5.5 Practical Notes
+##### 7.2.6.5 Practical Notes
 - RM callbacks may run in interrupt context if clients make requests there, so they should be non-blocking or offload heavy work.
 - Monitoring hooks can observe transitions or failures, enabling logging or watchdog-style resets without tightly coupling to the resource owner.
 - Because RM and Device PM are orthogonal, it’s common to see RM manage an internal sub-resource while the encompassing Device PM handler coordinates with the rest of the system.
+
+#### 7.2.7 Wakeup capability
+1. Declaring and enabling wakeup capability
+   - In devicetree, a device declares that it is *physically capable* of waking the system with:
+     - `wakeup-source;`
+   - At runtime, the application or driver calls:
+     - `pm_device_wakeup_enable(dev, true/false)`
+   - When a device is both **wakeup-capable** (DT flag) and **wakeup-enabled** (API flag), the PM core marks it as a wake source:
+     - Such a device **will not be suspended by system-managed device PM** when the system goes into low-power modes.   
+
+2. Effect on system-managed vs runtime-PM devices
+   - **System-managed device PM**
+     - For these devices, wakeup-enable has a direct effect:
+       - `pm_suspend_devices()` *skips* wakeup-enabled devices, leaving them ACTIVE so they can generate wake events.
+     - This is the primary intended use of `wakeup-source` + `pm_device_wakeup_enable()`.
+
+   - **Runtime (RT) device PM**
+     - Runtime-PM devices are **already skipped** by system-managed device PM, regardless of wakeup flags:
+       - System suspend/resume does **not** call their `PM_DEVICE_ACTION_SUSPEND/RESUME`.
+     - Therefore, the “do not suspend this device during system state transition” effect of `pm_device_wakeup_enable()` is **mostly irrelevant** for RT-PM devices, because system PM doesn’t suspend them anyway.
+     - However, the wakeup flags are still meaningful as **metadata**:
+       - The driver/app can query:
+         - `pm_device_wakeup_is_capable(dev)`
+         - `pm_device_wakeup_is_enabled(dev)`
+       - A runtime-PM driver can use these to decide whether it should keep the device ACTIVE (not suspend via runtime PM) when it is being used as a wake source.
+
+3. Driver responsibility for hardware wake configuration
+   - `pm_device_wakeup_enable()` only updates PM core flags; it does **not** program hardware.
+   - Either:
+     - The **application** configures the peripheral / SoC wake bits when it calls `pm_device_wakeup_enable()`, or
+     - The **driver** exposes its own API (e.g. `mydev_enable_wakeup(dev, bool)`), which:
+       - configures hardware wake (IRQ, event routing, SoC wake bits),
+       - and calls `pm_device_wakeup_enable()` internally.
+   - There is **no automatic callback** into the driver when the app toggles wakeup; the driver must be in the call chain itself if it wants to react.
+
+4. **Limitation: wakeup capability is not per system power state**
+   - Zephyr’s wakeup model is **not differentiated per `pm_state`**:
+     - A device is either “wakeup-capable and enabled” or not, globally.
+     - There is no built-in notion of “can wake from S1/S2 but not from S4”.
+   - The PM core does not check “is this device a valid wake source *for this particular system state*?” — it only checks “is this device wake-enabled?” to decide whether to skip suspending it.
+
+   - **Workarounds / app-side patterns:**
+     - Use **PM notifiers** (`pm_notifier_register()`) or custom hooks so some component is informed when the system is preparing to enter/leave specific power states.
+     - Based on the *target* state, the app/driver can:
+       - Configure or deconfigure the device as a wake source at the hardware level, and/or
+       - Enable or disable it as a wake source using `pm_device_wakeup_enable()`.
+     - This gives you *policy-level* per-state behavior, but it is not enforced automatically by the PM core the way `zephyr,disabling-power-states` is for “power cut” constraints.
+
+#### 7.2.8 Power Management Limitations
+1. **Idle-driven entry for resume-able system states**
+   - All transitions into `pm_state`-based sleep modes are driven by the idle thread via `pm_system_suspend()`.
+   - Applications can decide *which* state to use (policy, `pm_state_force`) and can orchestrate work so that cores become idle, but they cannot directly enter a system power state from arbitrary thread/ISR context; at least one core must reach idle.
+   - A separate `sys_poweroff()` API exists for immediate power-off, but that is outside the `pm_state`/resume path.
+
+2. **Runtime Device PM is decoupled from System PM**
+   - Devices using runtime device PM are skipped by system-managed device PM; system suspend/resume does not call their device PM callbacks.
+   - If a runtime-PM-managed component needs to react to system suspend/resume, it must opt in explicitly (e.g., via `pm_notifier_register()` or custom hooks). There is no automatic “RT PM aware” system PM integration.
+
+3. **Wakeup capability is coarse and not per-state**
+   - Wake sources are modeled with `wakeup-source` in devicetree and `pm_device_wakeup_enable()/disable()` at runtime.
+   - This is a global “do not suspend this device” hint for system PM, not a per-`pm_state` capability model (e.g., “valid wake from s2idle but not s2ram” is not encoded).
+   - The application/policy remains responsible for ensuring that, for any chosen `pm_state`, at least one **actually valid** wake source remains active.
+
+4. **Drivers are not notified when wakeup is toggled**
+   - `pm_device_wakeup_enable()/disable()` only updates PM core flags; there is no automatic callback into the driver.
+   - Drivers must either:
+     - expose their own `*_enable_wakeup()` API that both configures HW and calls the PM API, or
+     - rely on the application to configure HW wake correctly when enabling wakeup.
+
+5. **CPU vs system semantics of `pm_state` are implicit**
+   - The same `pm_state` abstraction is used for both per-CPU idle states and system sleep states.
+   - The actual behavior is determined by SoC-specific `pm_state_set()` and by whether the power-state node has `zephyr,pm-device-disabled`.
+   - There is no separate, explicit type system for “pure CPU C-state” vs “system sleep + device PM”; the separation is convention + platform implementation.
 
 ### 7.3 CPU Frequency Scaling
 
@@ -840,4 +1028,3 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
 - Automatic scaling only happens if a policy (or application code) actively requests changes; otherwise the CPU remains at the initial P-state.
 - Metrics are pluggable: any signal measurable in kernel context—performance counters, thermal sensors, workload hints—can feed into the policy.
 - Align policy timer context with driver requirements: since `cpu_freq_pstate_set()` must be IRQ-safe, lightweight policies can run directly from the subsystem timer, while heavier analytics should defer work to a thread before invoking the driver.
-
