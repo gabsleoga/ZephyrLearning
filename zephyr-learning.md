@@ -74,60 +74,62 @@ The Zephyr build process consists of two main phases:
   - Non-fixed size: Relocatable in memory (for dynamic loading)
   - Fixed size: Linked to specific addresses (typical for bare metal)
 
-## 2. Device Tree Bindings
+## 2. Device Tree
+
+> 🌲 **Device tree TL;DR:** Zephyr treats hardware description as data. Boards ship canonical `.dts`/`.dtsi` files, applications optionally overlay them, and YAML bindings guarantee every node is validated before `dtc` compiles the result into C-friendly metadata.
 
 ### 2.1 Core Concepts
-1. Binding files (`.yaml`) define:
-   - Required and optional properties for DT nodes
-   - Property types, constraints, and validation rules
-   - Location: `dts/bindings/<vendor>/<device>.yaml` matching `compatible` string
-   - Example: `compatible = "nordic,nrf52840-gpio"` → `dts/bindings/gpio/nordic,nrf52840-gpio.yaml`
+1. **Source hierarchy:**
+  - Board file (e.g. `boards/nordic/nrf52840dk_nrf52840/nrf52840dk_nrf52840.dts`) includes SoC-level `.dtsi` plus common fragments (`soc/arm/nordic_nrf/nrf52.dtsi`, pinctrl `.dtsi`, etc.).
+  - Applications can add overlay files (`app.overlay` next to `prj.conf` or paths passed via `-DDTC_OVERLAY_FILE="file1.overlay;file2.overlay"`). Overlays are applied *after* board + SoC files, so later entries win.
+  - Each node name follows `name@unit-address`; labels (`label = "SENSOR";`) are optional but handy for `DT_NODELABEL` lookups. A node is active only if `status = "okay"` (anything else prevents driver instantiation).
 
-2. Node Matching Process:
-   - Nodes can have multiple strings in `compatible` property
-   - Build system searches bindings in order listed in `compatible`
-   - Uses first matching binding found
-   - Example: `compatible = "vendor,specific-model", "vendor,generic-model"`
-     - Tries `vendor,specific-model` first
-     - Falls back to `vendor,generic-model` if specific not found
+2. **Binding files (`.yaml`) describe schema + validation:**
+  - Define required/optional properties, types, defaults, enums, `deprecated:` markers, and bus relationships. Location matches the `compatible` string: `dts/bindings/gpio/nordic,nrf-gpio.yaml` satisfies `compatible = "nordic,nrf-gpio"`.
+  - Bindings can inherit (`include:`) other schemas or specify `on-bus:` (e.g. `i2c`), which constrains where a node may live.
 
-3. Child Bindings:
-   - When a node has no matching `compatible`:
-     - Build system checks parent node's binding file
-     - Parent's `child-binding` section defines properties for children
-   - Common in bus devices (I2C/SPI):
-     - Parent: I2C controller with binding
-     - Children: I2C devices using parent's child-binding
-   - Example:
-     ```yaml
-     # i2c-controller.yaml
-     child-binding:
-       properties:
-         reg:
-           required: true
-         clock-frequency:
-           type: int
-     ```
-### 2.2 Key Features
-- Build System Processing:
-  - Validates node properties against binding schema
-  - Generates C header with devicetree macros
-  - Outputs: 
-    1. `build/zephyr/zephyr.dts`: Final devicetree
-    2. `build/zephyr/include/generated/devicetree_generated.h`: C macros for DT access
+3. **Node matching order:**
+  - `compatible` is an ordered list. The build system tries the first entry, falls back to the next if no binding exists, and stops at the first success. This mirrors Linux DT behavior and is crucial for vendor-override → generic fallback flows.
+
+4. **Child bindings:**
+  - If a child node lacks its own binding, the parent’s `child-binding` section defines its schema. Typical for buses: an I²C controller binding specifies `child-binding` with `reg`, `clock-frequency`, interrupts, etc., so every `foo@xx` child automatically inherits those rules.
+
+### 2.2 Build-Time Flow & Outputs
+1. `west build` (CMake configure step) gathers the board DTS, all included `.dtsi`, and overlays listed in `DTC_OVERLAY_FILE`. You can append extra flags via `-DDTC_FLAGS="-Wno-unit_address_vs_reg"`.
+2. `dtc` compiles the merged tree into `build/zephyr/zephyr.dts` and a flattened blob. Zephyr’s `gen_defines.py` then produces:
+  - `build/zephyr/include/generated/devicetree_generated.h` (macro accessors used by `DEVICE_DT_GET()`, `DT_PROP`, etc.).
+  - `build/zephyr/zephyr.dts.pre.tmp` / `.post.tmp` for debugging what got included before/after overlays.
+3. Optional helpers: `ninja -C build dtc` re-runs devicetree generation only; `ninja -C build dump` dumps the flattened tree; `build/zephyr/zephyr.dts` is the file to inspect when something doesn’t instantiate.
 
 ### 2.3 Practical Usage
-1. Find bindings:
-   - Check node's `compatible` property
-   - Search in `dts/bindings/` matching vendor/device structure
-   - Look for parent's binding if no direct match
+1. **Find the right binding + node:**
+  - Read the node’s `compatible` property and search `dts/bindings/**/compatible.yaml`. If nothing matches, look at the parent’s `child-binding`.
+  - Use `zephyr/boards/*/*.dts` plus overlay stacking to see where a property originated (`#include` order mirrors the include lines at the top of the DTS file).
 
-2. Access DT data:
-   - Use generated macros in C code:
-     - `DT_NODELABEL(label)`: Reference node by label
-     - `DT_PROP(node_id, property)`: Get property value
-     - `DT_INST(n, compatible)`: Get nth instance of compatible
-   - 📝 **TODO:** Add a short worked example (board overlay → generated macro usage) to illustrate the full lookup path.
+2. **Access DT data in code:**
+  - Common macros: `DT_NODELABEL(label)`, `DT_ALIAS(name)`, `DT_PATH(path, to, node)`, `DT_INST(n, compatible)`, `DT_FOREACH_PROP_ELEM`, `DT_FIXED_LOAD_ADDRESS()` for ROMable data.
+  - Use `DEVICE_DT_GET(node_id)` or `GPIO_DT_SPEC_GET(node_id, gpios)` helper macros to build typed specs (GPIO/SPI/PWM). These helpers enforce binding-defined property structures at compile time.
+  - 📝 **TODO:** Add a short worked example (board overlay → generated macro usage) to illustrate the full lookup path.
+
+### 2.4 Source Layout & Overlays
+- **Board default tree:** Located under `boards/<vendor>/<board>/<board>.dts`. Usually sets high-level topology and references SoC includes via `/ { #include <soc/dts_fixup.h> }` patterns.
+- **Application overlays:** Files named `app.overlay` (or specified list) extend/override nodes. Multiple overlays are semicolon-separated; later ones can delete nodes via `/delete-node/` or update props using `/delete-property/` before rewriting.
+- **SoC + subsystem fragments:** Core SoC features live in `soc/<arch>/<vendor>/<soc>.dtsi`; devices such as pinctrl, interrupt controllers, or power domains often have their own `.dtsi` included by both SoC and board files to avoid duplication.
+- **Overlay debugging:** Pass `cmake -DDTC_VERBOSE=1` to log how overlays were applied; inspect `build/zephyr/zephyr.dts.pre.tmp` vs `.post.tmp` to verify your changes landed.
+
+### 2.5 Node Identification Shortcuts
+- **Labels:** `DT_NODELABEL(uart0)` resolves nodes that include a devicetree node label like `uart0:` before the node definition. This is distinct from the runtime string property `label = "UART_0";`; node labels are identifiers used at build time, while the `label` property most drivers expose at runtime is just a string.
+- **Aliases:** The `/aliases` node maps terse names (`i2c-0`, `pwm-led0`) for board-level convenience. Access via `DT_ALIAS(...)`, remembering that dashes become underscores (`i2c-0` → `DT_ALIAS(i2c_0)`, `pwm-led0` → `DT_ALIAS(pwm_led0)`).
+- **Chosen nodes:** `/chosen` selects globally significant nodes (`zephyr,console`, `zephyr,bt-hci`). Use `DT_CHOSEN(zephyr_console)` to fetch them.
+- **Paths:** `DT_PATH(soc, spi_40004000, flash@0)` mirrors the hierarchical path when labels/aliases are absent.
+- **Instance iteration:** `DT_INST_FOREACH_STATUS_OKAY(fn)` or `LISTIFY(DT_NUM_INST_STATUS_OKAY(compat), fn, (,), data)` iterate over all enabled instances of a compatible—ideal for drivers that must register per-instance data structures.
+
+### 2.6 Tooling & Debugging Tips
+- `west build -t dtc` / `ninja dtc`: regenerate devicetree artifacts without rebuilding everything.
+- `ninja dt_diff`: emit a diff between `zephyr.dts` and `zephyr.dts.pre.tmp` to confirm overlay impact (handy when multiple overlays fight).
+- `python scripts/dts/` utilities: `dtlib.py` + `gen_defines.py` are what parse YAML + DTS; reading them clarifies how warning levels or custom directives behave.
+- Passing `cmake -DDTC_FLAGS="-Wno-unique_unit_address"` relaxes warnings during bring-up; capture final fixes in overlays so the flag can go away.
+- Remember: devicetree data is evaluated at build time only. Any runtime logic must pull values via the generated headers—no string parsing or `#include` of raw DTS files at runtime.
 
 ## 3. Scheduling, Threading, and Interrupts
 
@@ -450,38 +452,6 @@ Workqueues provide a mechanism for deferring work execution to a dedicated threa
 - Runtime PM (`CONFIG_PM_DEVICE_RUNTIME`) lets drivers automatically suspend after inactivity; they must call `pm_device_runtime_get_sync()` / `pm_device_runtime_put()` around critical sections.
 - SoC-level power states (idle, deep sleep) can cascade into driver callbacks, so drivers must leave hardware quiescent when asked to suspend.
 - When no custom PM handling is required, pass `NULL` for the control function in `DEVICE_DT_DEFINE()` and Zephyr skips the hooks.
-
-### 5.6 Simple Usage Examples
-- Fetching a device and toggling GPIO:
-  ```c
-  const struct device *led = DEVICE_DT_GET(DT_ALIAS(led0));
-
-  if (!device_is_ready(led)) {
-      return -ENODEV;
-  }
-
-  gpio_pin_configure_dt(&led0_spec, GPIO_OUTPUT_ACTIVE);
-  gpio_pin_toggle_dt(&led0_spec);
-  ```
-- Creating a lightweight custom driver (single instance):
-  ```c
-  static int dummy_init(const struct device *dev) {
-      const struct dummy_config *cfg = dev->config;
-      struct dummy_data *data = dev->data;
-      data->base = cfg->base;
-      return 0;
-  }
-
-  static struct dummy_data dummy0_data;
-  static const struct dummy_config dummy0_cfg = {
-      .base = DT_INST_REG_ADDR(0),
-  };
-
-  DEVICE_DT_INST_DEFINE(0, dummy_init, NULL,
-                        &dummy0_data, &dummy0_cfg,
-                        POST_KERNEL, 50, &dummy_api);
-  ```
-- 💡 **Tip:** Keep configuration structs `const` so they land in flash, and gate optional features behind Kconfig symbols to avoid initializing unused hardware.
 
 ## 6. OS Services
 
@@ -890,7 +860,7 @@ Reference: [Power domain docs](https://docs.zephyrproject.org/latest/services/pm
 - **Why use it:** Power domains provide a clean, declarative way to model shared rails, ensuring all devices hear about power removal/restoration and preventing ad-hoc GPIO toggles that desynchronize drivers from actual hardware state.
 
 **Example: two sensors on a shared I2C rail**
-1. Both sensors A and B are active, so each driver calls `pm_device_runtime_get()`. Their usage counts move to 1, and the I2C domain's aggregate usage becomes 2, keeping the rail on.
+1. Both sensors A and B are active, so each driver calls `pm_device_runtime_get()`, this increments their usage counts as well as the I2C domain's usage count. Their usage counts move to 1, and the I2C domain's aggregate usage becomes 2, keeping the rail on.
 2. Sensor A becomes idle and calls `pm_device_runtime_put()`. Its usage drops to 0, but B is still active, so the domain’s refcount stays at 1 and power remains applied.
 3. When sensor B also calls `pm_device_runtime_put()`, the domain refcount hits 0. The power-domain driver suspends, shuts the rail off, and sends `PM_DEVICE_ACTION_TURN_OFF` to both sensors. The next `get()` from either sensor automatically powers the rail back up.
 
